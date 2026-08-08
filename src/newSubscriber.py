@@ -1,290 +1,233 @@
+"""
+UDP receiver + parser for Unitree L1 LiDAR point-cloud and IMU data.
+No visualization here on purpose -- this module is meant to be dropped
+into another script (SLAM, obstacle avoidance, logging, etc.) via a
+plain `import`.
+
+Wire format (sent by the C++ bridge on the Orin Nano):
+    [msgType: uint32][length: uint32][payload...]
+
+    msgType 101 -> IMU packet.     payload = "=dI4f3f3f"
+    msgType 102 -> Scan packet.    payload = "=dII" + up to 120 * "fffffI"
+
+Example usage from another script:
+
+    from lidar_udp_receiver import LidarUDPReceiver, LidarScan, LidarIMU
+
+    with LidarUDPReceiver(port=12345) as receiver:
+        for message in receiver.stream():
+            if isinstance(message, LidarScan):
+                xyz, intensity = message.to_numpy()
+                # ... feed xyz into your obstacle-avoidance / SLAM code
+            elif isinstance(message, LidarIMU):
+                # ... use message.angular_velocity, etc.
+                pass
+"""
+
 import socket
 import struct
+import logging
+from dataclasses import dataclass
+from typing import Optional, Union, Iterator, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import time
-from datetime import datetime
 
-# Try to import open3d for better visualization (optional)
-try:
-    import open3d as o3d
-    HAS_OPEN3D = True
-except ImportError:
-    HAS_OPEN3D = False
-    print("Open3D not installed. Install with: pip install open3d")
-    print("Using matplotlib for visualization instead.")
+logger = logging.getLogger(__name__)
 
-# IP and Port
-UDP_IP = "0.0.0.0"
-UDP_PORT = 12345
+# --- protocol constants -----------------------------------------------------
 
-# Point Type
-class PointUnitree:
-    def __init__(self, x, y, z, intensity, time, ring):
-        self.x = x
-        self.y = y
-        self.z = z
-        self.intensity = intensity
-        self.time = time
-        self.ring = ring
+MSG_TYPE_IMU = 101
+MSG_TYPE_SCAN = 102
 
-# Scan Type
-class ScanUnitree:
-    def __init__(self, stamp, id, validPointsNum, points):
-        self.stamp = stamp
-        self.id = id
-        self.validPointsNum = validPointsNum
-        self.points = points
-    
-    def to_numpy_array(self):
-        """Convert points to numpy array for easier processing"""
-        points_array = np.array([[p.x, p.y, p.z] for p in self.points[:self.validPointsNum]])
-        intensities = np.array([p.intensity for p in self.points[:self.validPointsNum]])
-        return points_array, intensities
+"""The C++ side packs a fixed-size buffer of up to this many points per scan
+packet (only the first `valid_points_num` of them are meaningful). Used
+here as a safety cap so a corrupted/short packet can't make us read past
+the end of the buffer."""
+MAX_POINTS_PER_SCAN = 120
 
-# IMU Type
-class IMUUnitree:
-    def __init__(self, stamp, id, quaternion, angular_velocity, linear_acceleration):
-        self.stamp = stamp
-        self.id = id
-        self.quaternion = quaternion
-        self.angular_velocity = angular_velocity
-        self.linear_acceleration = linear_acceleration
 
-# Point Cloud Visualizer
-class PointCloudVisualizer:
-    def __init__(self, use_open3d=False):
-        self.use_open3d = use_open3d and HAS_OPEN3D
-        self.fig = None
-        self.ax = None
-        self.scatter = None
-        
-        if self.use_open3d:
-            self.init_open3d()
-        else:
-            self.init_matplotlib()
-    
-    def init_open3d(self):
-        """Initialize Open3D visualizer"""
-        self.vis = o3d.visualization.Visualizer()
-        self.vis.create_window(window_name="Unitree LiDAR Point Cloud", width=1024, height=768)
-        self.pcd = o3d.geometry.PointCloud()
-        self.vis.add_geometry(self.pcd)
-        
-        # Set view control
-        ctr = self.vis.get_view_control()
-        ctr.set_front([0, 0, -1])
-        ctr.set_lookat([0, 0, 0])
-        ctr.set_up([0, -1, 0])
-        ctr.set_zoom(0.8)
-    
-    def init_matplotlib(self):
-        """Initialize matplotlib 3D plot"""
-        plt.ion()  # Interactive mode
-        self.fig = plt.figure(figsize=(10, 8))
-        self.ax = self.fig.add_subplot(111, projection='3d')
-        self.ax.set_xlabel('X (m)')
-        self.ax.set_ylabel('Y (m)')
-        self.ax.set_zlabel('Z (m)')
-        self.ax.set_title('Unitree LiDAR Point Cloud')
-        
-        # Set equal aspect ratio
-        self.ax.set_box_aspect([1, 1, 1])
-        
-        plt.tight_layout()
-        plt.show()
-    
-    def update_open3d(self, points, intensities=None):
-        """Update Open3D point cloud"""
-        if len(points) == 0:
-            return
-        
-        self.pcd.points = o3d.utility.Vector3dVector(points)
-        
-        if intensities is not None and len(intensities) > 0:
-            # Normalize intensities for coloring
-            intensities_norm = (intensities - intensities.min()) / (intensities.max() - intensities.min() + 1e-6)
-            colors = plt.cm.jet(intensities_norm)[:, :3]
-            self.pcd.colors = o3d.utility.Vector3dVector(colors)
-        
-        self.vis.update_geometry(self.pcd)
-        self.vis.poll_events()
-        self.vis.update_renderer()
-    
-    def update_matplotlib(self, points, intensities=None):
-        """Update matplotlib plot"""
-        if len(points) == 0:
-            return
-        
-        self.ax.clear()
-        self.ax.set_xlabel('X (m)')
-        self.ax.set_ylabel('Y (m)')
-        self.ax.set_zlabel('Z (m)')
-        self.ax.set_title('Unitree LiDAR Point Cloud')
-        
-        # Color by intensity or by height
-        if intensities is not None and len(intensities) > 0:
-            scatter = self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], 
-                                     c=intensities, cmap='viridis', s=1, alpha=0.6)
-            #self.fig.colorbar(scatter, ax=self.ax, label='Intensity')
-        else:
-            # Color by height (Z)
-            scatter = self.ax.scatter(points[:, 0], points[:, 1], points[:, 2], 
-                                     c=points[:, 2], cmap='viridis', s=1, alpha=0.6)
-            #self.fig.colorbar(scatter, ax=self.ax, label='Height (m)')
-        
-        # Set equal aspect ratio
-        if len(points) > 0:
-            max_range = max(points[:, 0].max() - points[:, 0].min(),
-                           points[:, 1].max() - points[:, 1].min(),
-                           points[:, 2].max() - points[:, 2].min()) / 2.0
-            
-            mid_x = (points[:, 0].max() + points[:, 0].min()) * 0.5
-            mid_y = (points[:, 1].max() + points[:, 1].min()) * 0.5
-            mid_z = (points[:, 2].max() + points[:, 2].min()) * 0.5
-            
-            self.ax.set_xlim(mid_x - max_range, mid_x + max_range)
-            self.ax.set_ylim(mid_y - max_range, mid_y + max_range)
-            self.ax.set_zlim(mid_z - max_range, mid_z + max_range)
-        
-        plt.draw()
-        plt.pause(0.01)
-    
-    def close(self):
-        """Close visualizer"""
-        if self.use_open3d:
-            self.vis.destroy_window()
-        else:
-            plt.ioff()
-            plt.close()
+# --- data containers ---------------------------------------------------------
 
-def filter_points(points, intensities, distance_threshold=5000.0):
-    """Filter points by distance and remove NaN/invalid points"""
-    # Calculate distance from origin
-    distances = np.linalg.norm(points, axis=1)
-    
-    # Filter points within threshold
-    valid_mask = (distances < distance_threshold) & (~np.isnan(points).any(axis=1))
-    
-    return points[valid_mask], intensities[valid_mask]
+@dataclass
+class LidarPoint:
+    """A single LiDAR return. Mainly a convenience view onto one row of a
+    LidarScan's `points` array -- for bulk processing, work with
+    LidarScan.to_numpy() instead, it's much faster."""
+    x: float
+    y: float
+    z: float
+    intensity: float
+    time: float
+    ring: int
 
-def main():
-    # Create UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((UDP_IP, UDP_PORT))
-    sock.settimeout(1.0)  # Set timeout to 1 second
-    
-    # Calculate Struct Sizes
-    imuDataStr = "=dI4f3f3f"
-    imuDataSize = struct.calcsize(imuDataStr)
-    
-    pointDataStr = "=fffffI"
-    pointSize = struct.calcsize(pointDataStr)
-    
-    scanDataStr = "=dII" + 120 * "fffffI"
-    scanDataSize = struct.calcsize(scanDataStr)
-    
-    print("=" * 60)
-    print("Unitree LiDAR Point Cloud Receiver")
-    print("=" * 60)
-    print("Listening on {}:{}".format(UDP_IP, UDP_PORT))
-    print("pointSize = {}, scanDataSize = {}, imuDataSize = {}".format(pointSize, scanDataSize, imuDataSize))
-    print("=" * 60)
-    
-    # Initialize visualizer
-    use_open3d = raw_input("Use Open3D for better visualization? (y/n): ").lower() == 'y' if hasattr(__builtins__, 'raw_input') else input("Use Open3D for better visualization? (y/n): ").lower() == 'y'
-    visualizer = PointCloudVisualizer(use_open3d=use_open3d)
-    
-    # Statistics
-    frame_count = 0
-    total_points = 0
-    start_time = time.time()
-    
-    try:
+
+@dataclass
+class LidarScan:
+    stamp: float
+    id: int
+    valid_points_num: int
+    points: np.ndarray  # structured array, dtype = POINT_DTYPE, length == valid_points_num
+
+    def to_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (Nx3 xyz array, N-length intensity array) for this scan."""
+        xyz = np.stack([self.points['x'], self.points['y'], self.points['z']], axis=1)
+        return xyz, self.points['intensity']
+
+    def point(self, i: int) -> LidarPoint:
+        """Convenience accessor for a single point as a LidarPoint object.
+        Fine for occasional single-point lookups; use to_numpy() instead if
+        you're processing the whole scan, since building a LidarPoint per
+        point in a loop defeats the point of the vectorized parsing below."""
+        p = self.points[i]
+        return LidarPoint(float(p['x']), float(p['y']), float(p['z']),
+                           float(p['intensity']), float(p['time']), int(p['ring']))
+
+
+@dataclass
+class LidarIMU:
+    stamp: float
+    id: int
+    quaternion: Tuple[float, float, float, float]
+    angular_velocity: Tuple[float, float, float]
+    linear_acceleration: Tuple[float, float, float]
+
+
+# --- binary layout -----------------------------------------------------------
+
+# One point = 5 little-endian float32s (x, y, z, intensity, time) + 1 uint32 (ring)
+_POINT_DTYPE = np.dtype([
+    ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+    ('intensity', '<f4'), ('time', '<f4'), ('ring', '<u4'),
+])
+
+_HEADER_STRUCT = struct.Struct("=I")         # msgType (length field follows but isn't needed to parse)
+_IMU_STRUCT = struct.Struct("=dI4f3f3f")
+_SCAN_HEADER_STRUCT = struct.Struct("=dII")  # stamp, id, validPointsNum
+
+
+def parse_imu(payload: bytes) -> LidarIMU:
+    """Parse an IMU packet body (everything after the 8-byte msgType+length header)."""
+    data = _IMU_STRUCT.unpack(payload[:_IMU_STRUCT.size])
+    return LidarIMU(
+        stamp=data[0],
+        id=data[1],
+        quaternion=data[2:6],
+        angular_velocity=data[6:9],
+        linear_acceleration=data[9:12],
+    )
+
+
+def parse_scan(payload: bytes) -> LidarScan:
+    """Parse a Scan packet body (everything after the 8-byte msgType+length header)."""
+    stamp, scan_id, valid_points_num = _SCAN_HEADER_STRUCT.unpack(
+        payload[:_SCAN_HEADER_STRUCT.size]
+    )
+    points_bytes = payload[_SCAN_HEADER_STRUCT.size:]
+    count = min(valid_points_num, MAX_POINTS_PER_SCAN)
+    points = np.frombuffer(points_bytes, dtype=_POINT_DTYPE, count=count)
+    return LidarScan(stamp=stamp, id=scan_id, valid_points_num=count, points=points)
+
+
+# --- receiver ------------------------------------------------------------------
+
+class LidarUDPReceiver:
+    """
+    Owns a UDP socket and hands back parsed LidarScan / LidarIMU objects.
+    Pure data plumbing -- no plotting, no printing by default (uses `logging`
+    so the importing script controls verbosity).
+
+    Usage:
+        with LidarUDPReceiver(port=12345) as receiver:
+            for message in receiver.stream():
+                ...
+
+    or, without the context manager:
+        receiver = LidarUDPReceiver(port=12345)
+        receiver.open()
+        msg = receiver.receive_once()
+        ...
+        receiver.close()
+    """
+
+    def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
+                 timeout: float = 1.0, buffer_size: int = 65536):
+        self.ip = ip
+        self.port = port
+        self.timeout = timeout
+        self.buffer_size = buffer_size
+        self._sock: Optional[socket.socket] = None
+
+    def open(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind((self.ip, self.port))
+        self._sock.settimeout(self.timeout)
+        logger.info("Listening for LiDAR UDP data on %s:%d", self.ip, self.port)
+
+    def close(self) -> None:
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+            logger.info("Socket closed.")
+
+    def __enter__(self) -> "LidarUDPReceiver":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def receive_once(self) -> Optional[Union[LidarScan, LidarIMU]]:
+        """
+        Block up to `timeout` seconds for one UDP packet.
+        Returns the parsed message, or None on timeout / unknown / malformed packet.
+        """
+        if self._sock is None:
+            raise RuntimeError("Socket not open -- call open() or use a 'with' block first.")
+
+        try:
+            data, _addr = self._sock.recvfrom(self.buffer_size)
+        except socket.timeout:
+            return None
+
+        if len(data) < 8:
+            logger.warning("Received undersized packet (%d bytes), ignoring.", len(data))
+            return None
+
+        msg_type = _HEADER_STRUCT.unpack(data[:4])[0]
+        payload = data[8:]  # skip the 4-byte msgType + 4-byte length header
+
+        try:
+            if msg_type == MSG_TYPE_IMU:
+                return parse_imu(payload)
+            elif msg_type == MSG_TYPE_SCAN:
+                return parse_scan(payload)
+            else:
+                logger.warning("Unknown message type: %d", msg_type)
+                return None
+        except struct.error as e:
+            logger.warning("Failed to parse packet (msgType=%d): %s", msg_type, e)
+            return None
+
+    def stream(self) -> Iterator[Union[LidarScan, LidarIMU]]:
+        """Generator that yields parsed messages forever, skipping timeouts."""
         while True:
-            try:
-                # Receive data
-                data, addr = sock.recvfrom(65536)  # Increased buffer size
-                
-                msgType = struct.unpack("=I", data[:4])[0]
-                
-                if msgType == 101:  # IMU Message
-                    length = struct.unpack("=I", data[4:8])[0]
-                    imuData = struct.unpack(imuDataStr, data[8:8+imuDataSize])
-                    imuMsg = IMUUnitree(imuData[0], imuData[1], imuData[2:6], 
-                                       imuData[6:9], imuData[9:12])
-                    
-                    # Optionally print IMU data (comment out for performance)
-                    # print("IMU - stamp: {}, id: {}".format(imuMsg.stamp, imuMsg.id))
-                
-                elif msgType == 102:  # Scan Message
-                    length = struct.unpack("=I", data[4:8])[0]
-                    stamp = struct.unpack("=d", data[8:16])[0]
-                    id_val = struct.unpack("=I", data[16:20])[0]
-                    validPointsNum = struct.unpack("=I", data[20:24])[0]
-                    
-                    scanPoints = []
-                    pointStartAddr = 24
-                    
-                    for i in range(validPointsNum):
-                        pointData = struct.unpack(pointDataStr, 
-                                                data[pointStartAddr: pointStartAddr+pointSize])
-                        pointStartAddr += pointSize
-                        point = PointUnitree(*pointData)
-                        scanPoints.append(point)
-                    
-                    scanMsg = ScanUnitree(stamp, id_val, validPointsNum, scanPoints)
-                    
-                    # Convert to numpy array
-                    points, intensities = scanMsg.to_numpy_array()
-                    
-                    # Filter points
-                    points, intensities = filter_points(points, intensities, distance_threshold=500.0)
-                    
-                    # Update statistics
-                    frame_count += 1
-                    total_points += len(points)
-                    elapsed_time = time.time() - start_time
-                    fps = frame_count / elapsed_time if elapsed_time > 0 else 0
-                    
-                    # Print scan info (using string formatting instead of f-strings)
-                    print("\n[Scan #{}] ID: {}, Timestamp: {:.3f}".format(frame_count, id_val, stamp))
-                    print("  Valid points: {}, Filtered points: {}".format(validPointsNum, len(points)))
-                    print("  FPS: {:.2f}, Total points: {}".format(fps, total_points))
-                    
-                    # Update visualization
-                    if len(points) > 0:
-                        if visualizer.use_open3d:
-                            visualizer.update_open3d(points, intensities)
-                        else:
-                            visualizer.update_matplotlib(points, intensities)
-                    
-                    # Print point range
-                    if len(points) > 0:
-                        print("  X range: [{:.2f}, {:.2f}]".format(points[:, 0].min(), points[:, 0].max()))
-                        print("  Y range: [{:.2f}, {:.2f}]".format(points[:, 1].min(), points[:, 1].max()))
-                        print("  Z range: [{:.2f}, {:.2f}]".format(points[:, 2].min(), points[:, 2].max()))
-                        print("  Intensity range: [{:.2f}, {:.2f}]".format(intensities.min(), intensities.max()))
-                
-                else:
-                    print("Unknown message type: {}".format(msgType))
-                    
-            except socket.timeout:
-                # Timeout is normal, continue listening
-                continue
-            except Exception as e:
-                print("Error processing message: {}".format(e))
-                continue
-                
-    except KeyboardInterrupt:
-        print("\n\nShutting down...")
-        print("Final statistics: {} frames, {} points".format(frame_count, total_points))
-    
-    finally:
-        visualizer.close()
-        sock.close()
-        print("Cleanup complete")
+            msg = self.receive_once()
+            if msg is not None:
+                yield msg
+
 
 if __name__ == "__main__":
-    main()
+    # Minimal smoke test when this file is run directly (not for visualization,
+    # just to confirm packets are arriving and parsing correctly).
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    with LidarUDPReceiver() as receiver:
+        try:
+            for message in receiver.stream():
+                if isinstance(message, LidarScan):
+                    print(f"Scan #{message.id}: {message.valid_points_num} points, "
+                          f"stamp={message.stamp:.3f}")
+                elif isinstance(message, LidarIMU):
+                    print(f"IMU  #{message.id}: stamp={message.stamp:.3f}, "
+                          f"ang_vel={message.angular_velocity}")
+        except KeyboardInterrupt:
+            print("\nStopped.")
