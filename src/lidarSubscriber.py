@@ -30,19 +30,24 @@ Example usage (buffered):
 
     from lidar_udp_receiver import LidarStream
 
-    with LidarStream(port=12345, scan_maxlen=50, imu_maxlen=500) as lidar:
+    with LidarStream(port=12345, scan_maxlen=100, imu_maxlen=100) as lidar:
         while True:
-            scan = lidar.scans.latest()
+            # single newest reading
+            scan = lidar.latest_scan
             if scan is not None:
                 xyz, intensity = scan.to_numpy()
                 # ... feed xyz into your obstacle-avoidance / SLAM code
 
-            imu = lidar.imu.latest()
-            if imu is not None:
-                # ... use imu.angular_velocity, etc.
-                pass
+            # or the N most recent, oldest-first
+            for s in lidar.recent_scans(25):
+                ...
+            recent_imu = lidar.recent_imu(10)
 
             time.sleep(0.05)
+
+    Asking for more than the buffer's capacity raises ValueError (it can never
+    be satisfied). Asking for more than have arrived *so far* just returns what
+    is available, since that's normal right after startup.
 
 Example usage (pull, unchanged from before):
 
@@ -59,6 +64,7 @@ import time
 import logging
 import threading
 from collections import deque
+from itertools import islice
 from dataclasses import dataclass
 from typing import Optional, Union, Iterator, Tuple, List, Deque
 
@@ -239,21 +245,53 @@ class RingBuffer:
         with self._lock:
             return self._buf[-1] if self._buf else None
 
-    def latest_n(self, n: int) -> List:
-        """Up to the n most recent messages, oldest-first. Returns a plain list,
-        so it's a snapshot -- safe to iterate while the reader thread keeps
-        appending."""
+    def latest_n(self, n: int, allow_partial: bool = True) -> List:
+        """
+        The n most recent messages, oldest-first, as a plain list (a snapshot --
+        safe to iterate while the reader thread keeps appending).
+
+        Guardrails, and why they differ:
+
+        - n > maxlen  -> ALWAYS raises ValueError. This can never be satisfied
+          no matter how long you wait, so it's a bug in the calling code, not a
+          transient condition. Failing loudly here is the whole point; silently
+          handing back fewer would hide the mistake.
+
+        - n > however many are buffered RIGHT NOW (but still <= maxlen) -> by
+          default returns what's available. This happens constantly and
+          legitimately: right after start(), during a brief sensor dropout, or
+          after drain(). Raising here would crash your program on every startup.
+          Pass allow_partial=False if your math genuinely requires exactly n
+          samples (e.g. a fixed-window filter) and short data would silently
+          corrupt the result.
+
+        - n < 1 or non-integer -> raises, since that's always a caller bug.
+        """
+        # bool is a subclass of int, so True would sneak through as n=1.
+        if isinstance(n, bool) or not isinstance(n, int):
+            raise TypeError(f"n must be an int, got {type(n).__name__}")
         if n < 1:
-            return []
+            raise ValueError(f"n must be >= 1, got {n}")
+        if n > self.maxlen:
+            raise ValueError(
+                f"Asked for the {n} most recent messages, but this buffer only "
+                f"holds {self.maxlen}. Either lower n, or construct the stream "
+                f"with a bigger maxlen."
+            )
+
         with self._lock:
-            if n >= len(self._buf):
+            available = len(self._buf)
+            if n > available and not allow_partial:
+                raise ValueError(
+                    f"Asked for exactly {n} messages but only {available} have "
+                    f"arrived so far (buffer capacity {self.maxlen}). Wait for "
+                    f"more data, or use allow_partial=True."
+                )
+            if n >= available:
                 return list(self._buf)
-            # deque doesn't support slicing, so walk backwards then reverse.
-            items = []
-            for i in range(len(self._buf) - 1, len(self._buf) - 1 - n, -1):
-                items.append(self._buf[i])
-            items.reverse()
-            return items
+            # islice walks the deque once (O(n)); indexing it in a loop instead
+            # would be O(n^2), since deque indexing is O(n) toward the middle.
+            return list(islice(self._buf, available - n, available))
 
     def snapshot(self) -> List:
         """Everything currently buffered, oldest-first, as a plain list."""
@@ -399,7 +437,7 @@ class LidarStream:
     """
 
     def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
-                 scan_maxlen: int = 100, imu_maxlen: int = 100,
+                 scan_maxlen: int = 50, imu_maxlen: int = 500,
                  timeout: float = 1.0, buffer_size: int = 65536):
         self._receiver = LidarUDPReceiver(port=port, ip=ip,
                                           timeout=timeout, buffer_size=buffer_size)
@@ -469,6 +507,29 @@ class LidarStream:
     def latest_imu(self) -> Optional[LidarIMU]:
         """Most recent IMU sample, or None. Non-blocking."""
         return self.imu.latest()
+
+    def recent_scans(self, n: int, allow_partial: bool = True) -> List[LidarScan]:
+        """The n most recent scans, oldest-first. Non-blocking.
+
+        Raises ValueError if n exceeds the scan buffer's capacity (see
+        scan_capacity). Returns fewer than n if fewer have arrived yet, unless
+        allow_partial=False."""
+        return self.scans.latest_n(n, allow_partial=allow_partial)
+
+    def recent_imu(self, n: int, allow_partial: bool = True) -> List[LidarIMU]:
+        """The n most recent IMU samples, oldest-first. Non-blocking.
+        Same guardrails as recent_scans()."""
+        return self.imu.latest_n(n, allow_partial=allow_partial)
+
+    @property
+    def scan_capacity(self) -> int:
+        """Max scans the buffer can hold -- the ceiling for recent_scans(n)."""
+        return self.scans.maxlen
+
+    @property
+    def imu_capacity(self) -> int:
+        """Max IMU samples the buffer can hold -- the ceiling for recent_imu(n)."""
+        return self.imu.maxlen
 
     # --- reader thread ---
 
