@@ -25,6 +25,11 @@ Example usage from another script:
                 # ... use message.angular_velocity, etc.
                 pass
 """
+"""
+A big difference between the old subscriber and this is that this uses a structured numpy array to store scan data instead of just a normal array of point objects. A lot more efficient.
+Ex: notice how binary data is parsed directly into a structured numpy array. Or notice how the LidarPoint object is only used when trying to grab a single point. Nothing more. 
+Also uses dataclasses for cleaner class writing as well as typing for type hinting and stuff. If you see : or ->, that is type hinting.
+"""
 
 import socket
 import struct
@@ -96,7 +101,7 @@ class LidarIMU:
 
 # --- binary layout -----------------------------------------------------------
 
-# One point = 5 little-endian float32s (x, y, z, intensity, time) + 1 uint32 (ring)
+# One point = 5 little-endian float32s (x, y, z, intensity, time) + 1 uint32 (ring). For the structured numpy array.
 _POINT_DTYPE = np.dtype([
     ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
     ('intensity', '<f4'), ('time', '<f4'), ('ring', '<u4'),
