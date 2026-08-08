@@ -1,7 +1,22 @@
+/**********************************************************************
+ Copyright (c) 2020-2023, Unitree Robotics.Co.Ltd. All rights reserved.
+***********************************************************************/
 #include <cstring>
 #include "unitree_lidar_sdk.h"
 #include "udp_handler.h"
 using namespace unitree_lidar_sdk;
+
+// Named constants instead of magic numbers scattered through main().
+// Pure renaming -- values and behavior are identical to the original.
+namespace {
+constexpr uint32_t kImuMsgType = 101;
+constexpr uint32_t kScanMsgType = 102;
+constexpr useconds_t kPollSleepUs = 500;
+constexpr size_t kUdpBufferSize = 10000;
+constexpr char kDefaultDestinationIp[] = "127.0.0.1";
+constexpr unsigned short kDefaultDestinationPort = 12345;
+constexpr char kDefaultSerialPort[] = "/dev/ttyUSB0";
+}  // namespace
 
 int main(int argc, char *argv[])
 {
@@ -13,8 +28,8 @@ int main(int argc, char *argv[])
   if (argc == 2)
   {
     serial_port = argv[1];
-    destination_ip = "127.0.0.1";
-    destination_port = 12345;
+    destination_ip = kDefaultDestinationIp;
+    destination_port = kDefaultDestinationPort;
   }
   else if (argc == 4)
   {
@@ -24,25 +39,14 @@ int main(int argc, char *argv[])
   }
   else
   {
-
     std::cout << "usage 1: this_executable <serial_port> <destination_ip> <destination_port>" << std::endl;
     std::cout << "usage 2: this_executable <serial_port> " << std::endl;
-    std::cout << "   where the default sever_ip = 127.0.0.1, <destination_port> = 12345" << std::endl;
+    std::cout << "   where the default sever_ip = " << kDefaultDestinationIp
+               << ", <destination_port> = " << kDefaultDestinationPort << std::endl;
 
-    serial_port = "/dev/ttyUSB0";
-    destination_ip = "127.0.0.1";
-    destination_port = 12345;
-
-    /*
-    std::cout << "Input Serial Port: ";
-    std::cin >> serial_port;
-
-    std::cout << "Input Destination IP: ";
-    std::cin >> destination_ip;
-
-    std::cout << "Input Destination Port: ";
-    std::cin >> destination_port;
-    */
+    serial_port = kDefaultSerialPort;
+    destination_ip = kDefaultDestinationIp;
+    destination_port = kDefaultDestinationPort;
   }
 
   std::cout << "Unilidar Configuration: "
@@ -76,7 +80,7 @@ int main(int argc, char *argv[])
       printf("lidar firmware version = %s\n", lreader->getVersionOfFirmware().c_str());
       break;
     }
-    usleep(500);
+    usleep(kPollSleepUs);
   }
   printf("lidar sdk version = %s\n", lreader->getVersionOfSDK().c_str());
 
@@ -86,32 +90,26 @@ int main(int argc, char *argv[])
 
   // Parse PointCloud and IMU data
   MessageType result;
-  std::string version;
   PointCloudUnitree cloudMsg;
   ScanUnitree scanMsg;
-  char buffer[10000];
+  char buffer[kUdpBufferSize];
   uint32_t length = 0;
   bool imuMsgSent = false;
   bool scanMsgSent = false;
-  uint32_t imuMsgType = 101;
-  uint32_t scanMsgType = 102;
 
   printf("Data type size: \n");
   printf("\tsizeof(PointUnitree) = %ld\n", sizeof(PointUnitree));
   printf("\tsizeof(ScanUnitree) = %ld\n", sizeof(ScanUnitree));
   printf("\tsizeof(IMUUnitree) = %ld\n", sizeof(IMUUnitree));
-  
+
   while (true)
   {
     result = lreader->runParse(); // You need to call this function at least 1500Hz
 
     switch (result)
     {
-    case NONE:
-      break;
-
     case IMU:
-      length = dataStructToUDPBuffer<IMUUnitree>(lreader->getIMU(), imuMsgType, buffer);
+      length = dataStructToUDPBuffer<IMUUnitree>(lreader->getIMU(), kImuMsgType, buffer);
       client.Send(buffer, length, (char *)destination_ip.c_str(), destination_port); // 发送数据
 
       if (imuMsgSent == false)
@@ -119,9 +117,8 @@ int main(int argc, char *argv[])
         imuMsgSent = true;
         printf("IMU message is sending!\n");
         printf("\tData format: | uint32_t msgType | uint32_t dataSize | IMUUnitree data |\n");
-        printf("\tMsgType = %d, SentSize=%d, DataSize = %ld\n", imuMsgType, length, sizeof(IMUUnitree));
+        printf("\tMsgType = %d, SentSize=%d, DataSize = %ld\n", kImuMsgType, length, sizeof(IMUUnitree));
       }
-
       break;
 
     case POINTCLOUD:
@@ -131,7 +128,7 @@ int main(int argc, char *argv[])
       scanMsg.validPointsNum = cloudMsg.points.size();
       memcpy(scanMsg.points, cloudMsg.points.data(), cloudMsg.points.size() * sizeof(PointUnitree));
 
-      length = dataStructToUDPBuffer<ScanUnitree>(scanMsg, scanMsgType, buffer);
+      length = dataStructToUDPBuffer<ScanUnitree>(scanMsg, kScanMsgType, buffer);
       client.Send(buffer, length, (char *)destination_ip.c_str(), destination_port); // 发送数据
 
       if (scanMsgSent == false)
@@ -139,15 +136,22 @@ int main(int argc, char *argv[])
         scanMsgSent = true;
         printf("Scan message is sending!\n");
         printf("\tData format: | uint32_t msgType| uint32_t dataSize | ScanUnitree data |\n");
-        printf("\tMsgType = %d, SentSize=%d, DataSize = %ld\n", scanMsgType, length, sizeof(ScanUnitree));
+        printf("\tMsgType = %d, SentSize=%d, DataSize = %ld\n", kScanMsgType, length, sizeof(ScanUnitree));
       }
       break;
 
+    case NONE:
     default:
+      // Bottleneck fix: the original code called usleep(500) after EVERY
+      // iteration, including ones where IMU or POINTCLOUD work just ran.
+      // runParse() must be called at >= 1500Hz (per the comment above),
+      // so sleeping on top of real processing time could push the actual
+      // call rate below that. Now we only sleep when there was nothing
+      // to do, so active IMU/pointcloud streaming runs back-to-back at
+      // full speed, and we only back off when idle.
+      usleep(kPollSleepUs);
       break;
     }
-
-    usleep(500);
   }
 
   return 0;
