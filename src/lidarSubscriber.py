@@ -1,6 +1,6 @@
 """
-newSubscriber.py
- 
+lidar_udp_receiver.py
+
 UDP receiver + parser for Unitree L1 LiDAR point-cloud and IMU data.
 No visualization here on purpose -- this module is meant to be dropped
 into another script (SLAM, obstacle avoidance, logging, etc.) via a
@@ -12,30 +12,55 @@ Wire format (sent by the C++ bridge on the Orin Nano):
     msgType 101 -> IMU packet.     payload = "=dI4f3f3f"
     msgType 102 -> Scan packet.    payload = "=dII" + up to 120 * "fffffI"
 
-Example usage from another script:
+There are two ways to use this module:
+
+1. PULL / one-at-a-time (LidarUDPReceiver). You call receive_once() or
+   iterate stream(), and you get messages as they arrive. Simple, but your
+   loop has to keep up with the sensor or packets pile up in the OS socket
+   buffer and eventually get dropped by the kernel.
+
+2. PUSH / buffered (LidarStream). A background thread constantly drains the
+   socket and drops parsed messages into two separate bounded ring buffers
+   (one for scans, one for IMU). Your main loop then grabs the latest data
+   whenever it's ready, at whatever rate it wants. This is what you want if
+   your consumer runs slower than the sensor -- e.g. an obstacle-avoidance
+   loop at 20Hz reading from a ~500Hz IMU stream.
+
+Example usage (buffered):
+
+    from lidar_udp_receiver import LidarStream
+
+    with LidarStream(port=12345, scan_maxlen=50, imu_maxlen=500) as lidar:
+        while True:
+            scan = lidar.scans.latest()
+            if scan is not None:
+                xyz, intensity = scan.to_numpy()
+                # ... feed xyz into your obstacle-avoidance / SLAM code
+
+            imu = lidar.imu.latest()
+            if imu is not None:
+                # ... use imu.angular_velocity, etc.
+                pass
+
+            time.sleep(0.05)
+
+Example usage (pull, unchanged from before):
 
     from lidar_udp_receiver import LidarUDPReceiver, LidarScan, LidarIMU
 
     with LidarUDPReceiver(port=12345) as receiver:
         for message in receiver.stream():
-            if isinstance(message, LidarScan):
-                xyz, intensity = message.to_numpy()
-                # ... feed xyz into your obstacle-avoidance / SLAM code
-            elif isinstance(message, LidarIMU):
-                # ... use message.angular_velocity, etc.
-                pass
-"""
-"""
-A big difference between the old subscriber and this is that this uses a structured numpy array to store scan data instead of just a normal array of point objects. A lot more efficient.
-Ex: notice how binary data is parsed directly into a structured numpy array. Or notice how the LidarPoint object is only used when trying to grab a single point. Nothing more. 
-Also uses dataclasses for cleaner class writing as well as typing for type hinting and stuff. If you see : or ->, that is type hinting.
+            ...
 """
 
 import socket
 import struct
+import time
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass
-from typing import Optional, Union, Iterator, Tuple
+from typing import Optional, Union, Iterator, Tuple, List, Deque
 
 import numpy as np
 
@@ -46,10 +71,10 @@ logger = logging.getLogger(__name__)
 MSG_TYPE_IMU = 101
 MSG_TYPE_SCAN = 102
 
-"""The C++ side packs a fixed-size buffer of up to this many points per scan
-packet (only the first `valid_points_num` of them are meaningful). Used
-here as a safety cap so a corrupted/short packet can't make us read past
-the end of the buffer."""
+# The C++ side packs a fixed-size buffer of up to this many points per scan
+# packet (only the first `valid_points_num` of them are meaningful). Used
+# here as a safety cap so a corrupted/short packet can't make us read past
+# the end of the buffer.
 MAX_POINTS_PER_SCAN = 120
 
 
@@ -73,7 +98,7 @@ class LidarScan:
     stamp: float
     id: int
     valid_points_num: int
-    points: np.ndarray  # structured array, dtype = POINT_DTYPE, length == valid_points_num
+    points: np.ndarray  # structured array, dtype = _POINT_DTYPE, length == valid_points_num
 
     def to_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
         """Return (Nx3 xyz array, N-length intensity array) for this scan."""
@@ -87,7 +112,7 @@ class LidarScan:
         point in a loop defeats the point of the vectorized parsing below."""
         p = self.points[i]
         return LidarPoint(float(p['x']), float(p['y']), float(p['z']),
-                           float(p['intensity']), float(p['time']), int(p['ring']))
+                          float(p['intensity']), float(p['time']), int(p['ring']))
 
 
 @dataclass
@@ -101,7 +126,7 @@ class LidarIMU:
 
 # --- binary layout -----------------------------------------------------------
 
-# One point = 5 little-endian float32s (x, y, z, intensity, time) + 1 uint32 (ring). For the structured numpy array.
+# One point = 5 little-endian float32s (x, y, z, intensity, time) + 1 uint32 (ring).
 _POINT_DTYPE = np.dtype([
     ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
     ('intensity', '<f4'), ('time', '<f4'), ('ring', '<u4'),
@@ -130,30 +155,169 @@ def parse_scan(payload: bytes) -> LidarScan:
         payload[:_SCAN_HEADER_STRUCT.size]
     )
     points_bytes = payload[_SCAN_HEADER_STRUCT.size:]
-    count = min(valid_points_num, MAX_POINTS_PER_SCAN)
-    points = np.frombuffer(points_bytes, dtype=_POINT_DTYPE, count=count)
+
+    # Clamp against BOTH the protocol max and the bytes we actually received.
+    # Without the second clamp, a truncated packet makes np.frombuffer raise
+    # ValueError (not struct.error), which the caller's except clause missed.
+    available = len(points_bytes) // _POINT_DTYPE.itemsize
+    count = min(valid_points_num, MAX_POINTS_PER_SCAN, available)
+
+    # .copy() is deliberate: np.frombuffer returns a READ-ONLY view that also
+    # keeps the whole original packet alive in memory. Both are bad once these
+    # arrays get stored in a buffer -- callers can't modify the array in place,
+    # and memory usage balloons. ~3KB per scan, so the copy is cheap.
+    points = np.frombuffer(points_bytes, dtype=_POINT_DTYPE, count=count).copy()
+
     return LidarScan(stamp=stamp, id=scan_id, valid_points_num=count, points=points)
 
 
-# --- receiver ------------------------------------------------------------------
+def parse_packet(data: bytes) -> Optional[Union[LidarScan, LidarIMU]]:
+    """Parse one full UDP datagram. Returns None if it's too short, an unknown
+    message type, or malformed."""
+    if len(data) < 8:
+        logger.warning("Received undersized packet (%d bytes), ignoring.", len(data))
+        return None
+
+    msg_type = _HEADER_STRUCT.unpack(data[:4])[0]
+    payload = data[8:]  # skip the 4-byte msgType + 4-byte length header
+
+    try:
+        if msg_type == MSG_TYPE_IMU:
+            return parse_imu(payload)
+        elif msg_type == MSG_TYPE_SCAN:
+            return parse_scan(payload)
+        else:
+            logger.warning("Unknown message type: %d", msg_type)
+            return None
+    except (struct.error, ValueError) as e:
+        # ValueError matters: np.frombuffer raises it on a short/corrupt scan
+        # packet. In a background thread an uncaught exception would silently
+        # kill the reader and the buffers would just stop updating forever.
+        logger.warning("Failed to parse packet (msgType=%d): %s", msg_type, e)
+        return None
+
+
+# --- bounded ring buffer -------------------------------------------------------
+
+class RingBuffer:
+    """
+    Thread-safe bounded buffer of the most recent N messages.
+
+    Backed by collections.deque(maxlen=N): appending is O(1) and once it's
+    full, adding a new item automatically discards the OLDEST one. That's the
+    behavior you want for live sensor data -- if the consumer falls behind,
+    stale readings get dropped rather than growing memory without limit.
+
+    Every method takes a lock, because the producer (background socket thread)
+    and the consumer (your main loop) touch this concurrently.
+    """
+
+    def __init__(self, maxlen: int):
+        if maxlen < 1:
+            raise ValueError("maxlen must be >= 1")
+        self._buf: Deque = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._total_received = 0
+        self._total_dropped = 0
+
+    @property
+    def maxlen(self) -> int:
+        return self._buf.maxlen
+
+    def append(self, item) -> None:
+        """Add a message. Called by the reader thread; you shouldn't need this."""
+        with self._condition:
+            if len(self._buf) == self._buf.maxlen:
+                self._total_dropped += 1
+            self._buf.append(item)
+            self._total_received += 1
+            self._condition.notify_all()
+
+    def latest(self):
+        """Most recent message, or None if nothing has arrived yet."""
+        with self._lock:
+            return self._buf[-1] if self._buf else None
+
+    def latest_n(self, n: int) -> List:
+        """Up to the n most recent messages, oldest-first. Returns a plain list,
+        so it's a snapshot -- safe to iterate while the reader thread keeps
+        appending."""
+        if n < 1:
+            return []
+        with self._lock:
+            if n >= len(self._buf):
+                return list(self._buf)
+            # deque doesn't support slicing, so walk backwards then reverse.
+            items = []
+            for i in range(len(self._buf) - 1, len(self._buf) - 1 - n, -1):
+                items.append(self._buf[i])
+            items.reverse()
+            return items
+
+    def snapshot(self) -> List:
+        """Everything currently buffered, oldest-first, as a plain list."""
+        with self._lock:
+            return list(self._buf)
+
+    def drain(self) -> List:
+        """Everything currently buffered, oldest-first, AND clear the buffer.
+        Use this if you want each message exactly once instead of just the
+        newest -- e.g. integrating every IMU sample rather than sampling it."""
+        with self._lock:
+            items = list(self._buf)
+            self._buf.clear()
+            return items
+
+    def wait_for_new(self, timeout: Optional[float] = None):
+        """Block until a new message arrives, then return it (or None on
+        timeout). Cheaper and lower-latency than polling latest() in a busy
+        loop, since it sleeps until the reader thread actually wakes it."""
+        with self._condition:
+            count_before = self._total_received
+            got_one = self._condition.wait_for(
+                lambda: self._total_received != count_before, timeout=timeout
+            )
+            if not got_one:
+                return None
+            return self._buf[-1] if self._buf else None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buf.clear()
+
+    @property
+    def total_received(self) -> int:
+        """How many messages have ever been put in (not how many are held now)."""
+        with self._lock:
+            return self._total_received
+
+    @property
+    def total_dropped(self) -> int:
+        """How many were evicted because the buffer was full. If this climbs
+        steadily, your consumer loop is slower than the sensor -- either make
+        the buffer bigger or accept that you're sampling, not capturing."""
+        with self._lock:
+            return self._total_dropped
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._buf)
+
+
+# --- pull-style receiver (original behavior, kept) --------------------------------
 
 class LidarUDPReceiver:
     """
-    Owns a UDP socket and hands back parsed LidarScan / LidarIMU objects.
-    Pure data plumbing -- no plotting, no printing by default (uses `logging`
-    so the importing script controls verbosity).
+    Owns a UDP socket and hands back parsed LidarScan / LidarIMU objects
+    one at a time. Pure data plumbing -- no plotting, no printing by default.
+
+    If your consumer can't keep up with the sensor, use LidarStream instead.
 
     Usage:
         with LidarUDPReceiver(port=12345) as receiver:
             for message in receiver.stream():
                 ...
-
-    or, without the context manager:
-        receiver = LidarUDPReceiver(port=12345)
-        receiver.open()
-        msg = receiver.receive_once()
-        ...
-        receiver.close()
     """
 
     def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
@@ -196,24 +360,7 @@ class LidarUDPReceiver:
         except socket.timeout:
             return None
 
-        if len(data) < 8:
-            logger.warning("Received undersized packet (%d bytes), ignoring.", len(data))
-            return None
-
-        msg_type = _HEADER_STRUCT.unpack(data[:4])[0]
-        payload = data[8:]  # skip the 4-byte msgType + 4-byte length header
-
-        try:
-            if msg_type == MSG_TYPE_IMU:
-                return parse_imu(payload)
-            elif msg_type == MSG_TYPE_SCAN:
-                return parse_scan(payload)
-            else:
-                logger.warning("Unknown message type: %d", msg_type)
-                return None
-        except struct.error as e:
-            logger.warning("Failed to parse packet (msgType=%d): %s", msg_type, e)
-            return None
+        return parse_packet(data)
 
     def stream(self) -> Iterator[Union[LidarScan, LidarIMU]]:
         """Generator that yields parsed messages forever, skipping timeouts."""
@@ -223,18 +370,182 @@ class LidarUDPReceiver:
                 yield msg
 
 
+# --- push-style buffered stream ---------------------------------------------------
+
+class LidarStream:
+    """
+    Runs a background thread that continuously drains the UDP socket and files
+    parsed messages into two SEPARATE bounded ring buffers:
+
+        .scans -> RingBuffer of LidarScan
+        .imu   -> RingBuffer of LidarIMU
+
+    Your main loop reads whichever it wants, whenever it wants:
+
+        with LidarStream() as lidar:
+            scan = lidar.scans.latest()      # newest scan, or None
+            recent = lidar.imu.latest_n(10)  # last 10 IMU samples
+            everything = lidar.imu.drain()   # all buffered IMU, and clear
+
+    Sizing the buffers: pick roughly (sensor rate) x (how many seconds of
+    history you care about). IMU comes in far faster than scans, so it wants a
+    bigger buffer -- hence the separate defaults. Bigger buffers cost memory
+    but reduce dropped messages if your loop stutters.
+
+    Note on threading: this is genuinely useful here despite Python's GIL,
+    because the reader thread spends nearly all its time blocked in
+    socket.recvfrom() waiting on the OS, which releases the GIL. It is not
+    doing CPU work that would compete with your main loop.
+    """
+
+    def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
+                 scan_maxlen: int = 50, imu_maxlen: int = 500,
+                 timeout: float = 1.0, buffer_size: int = 65536):
+        self._receiver = LidarUDPReceiver(port=port, ip=ip,
+                                          timeout=timeout, buffer_size=buffer_size)
+        self.scans = RingBuffer(scan_maxlen)
+        self.imu = RingBuffer(imu_maxlen)
+
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    # --- lifecycle ---
+
+    def start(self) -> "LidarStream":
+        if self._thread is not None and self._thread.is_alive():
+            logger.warning("LidarStream already running; start() ignored.")
+            return self
+
+        self._receiver.open()
+        self._stop_event.clear()
+        # daemon=True so a forgotten stop() can't hang interpreter shutdown.
+        self._thread = threading.Thread(target=self._run, name="lidar-udp-reader",
+                                        daemon=True)
+        self._thread.start()
+        logger.info("LidarStream reader thread started.")
+        return self
+
+    def stop(self, join_timeout: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            # The thread can be sitting in recvfrom() for up to `timeout`
+            # seconds, so give it at least that long to notice the stop flag.
+            self._thread.join(timeout=join_timeout)
+            if self._thread.is_alive():
+                logger.warning("Reader thread did not exit within %.1fs.", join_timeout)
+            self._thread = None
+        self._receiver.close()
+        logger.info("LidarStream stopped.")
+
+    def __enter__(self) -> "LidarStream":
+        return self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.stop()
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    # --- non-blocking "just give me the current value" accessors ---
+    #
+    # These are plain attribute reads: they never wait on the network, never
+    # wait on the reader thread, and return immediately. If no data has
+    # arrived yet they return None.
+    #
+    # IMPORTANT: these are SNAPSHOTS, not live references. Doing
+    #     scan = lidar.latest_scan
+    # copies the current value into `scan` once. `scan` will NOT change on its
+    # own afterwards -- you have to read the property again to see newer data.
+    # (This is just how Python names work; nothing can make a local variable
+    # auto-refresh.) So read it fresh at the top of each loop iteration.
+
+    @property
+    def latest_scan(self) -> Optional[LidarScan]:
+        """Most recent point cloud, or None. Non-blocking."""
+        return self.scans.latest()
+
+    @property
+    def latest_imu(self) -> Optional[LidarIMU]:
+        """Most recent IMU sample, or None. Non-blocking."""
+        return self.imu.latest()
+
+    # --- reader thread ---
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                msg = self._receiver.receive_once()
+            except OSError as e:
+                # Socket closed out from under us during shutdown is expected.
+                if not self._stop_event.is_set():
+                    logger.error("Socket error in reader thread: %s", e)
+                break
+            except Exception as e:
+                # Catch-all so one weird packet can't silently kill the thread
+                # and leave the buffers frozen with no visible error.
+                logger.exception("Unexpected error in reader thread: %s", e)
+                continue
+
+            if msg is None:
+                continue  # timeout or malformed; loop and check stop flag again
+
+            if isinstance(msg, LidarScan):
+                self.scans.append(msg)
+            elif isinstance(msg, LidarIMU):
+                self.imu.append(msg)
+
+    # --- convenience ---
+
+    def wait_until_ready(self, timeout: float = 5.0) -> bool:
+        """Block until at least one scan AND one IMU message have arrived.
+        Returns False on timeout. Handy at startup so your first loop iteration
+        isn't full of Nones."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if len(self.scans) > 0 and len(self.imu) > 0:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def stats(self) -> dict:
+        """Counters for debugging throughput / whether you're dropping data."""
+        return {
+            "running": self.is_running,
+            "scans_held": len(self.scans),
+            "scans_total": self.scans.total_received,
+            "scans_dropped": self.scans.total_dropped,
+            "imu_held": len(self.imu),
+            "imu_total": self.imu.total_received,
+            "imu_dropped": self.imu.total_dropped,
+        }
+
+
 if __name__ == "__main__":
-    # Minimal smoke test when this file is run directly (not for visualization,
-    # just to confirm packets are arriving and parsing correctly).
+    # Minimal smoke test when run directly: confirms packets are arriving,
+    # parsing, and buffering correctly.
+
+
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    with LidarUDPReceiver() as receiver:
+
+    with LidarStream() as lidar:
+        print("Waiting for first data...")
+        if not lidar.wait_until_ready(timeout=5.0):
+            print("No data within 5s -- is the C++ bridge running?")
+
         try:
-            for message in receiver.stream():
-                if isinstance(message, LidarScan):
-                    print(f"Scan #{message.id}: {message.valid_points_num} points, "
-                          f"stamp={message.stamp:.3f}")
-                elif isinstance(message, LidarIMU):
-                    print(f"IMU  #{message.id}: stamp={message.stamp:.3f}, "
-                          f"ang_vel={message.angular_velocity}")
+            while True:
+                scan = lidar.scans.latest()
+                imu = lidar.imu.latest()
+
+                if scan is not None:
+                    print(f"Scan #{scan.id}: {scan.valid_points_num} points, "
+                          f"stamp={scan.stamp:.3f}")
+                if imu is not None:
+                    print(f"IMU  #{imu.id}: stamp={imu.stamp:.3f}, "
+                          f"ang_vel={imu.angular_velocity}")
+
+                print(f"  {lidar.stats()}")
+                time.sleep(0.5)
         except KeyboardInterrupt:
             print("\nStopped.")
