@@ -1,7 +1,7 @@
 import time
 import numpy as np
 import open3d as o3d
-from lidar_udp_receiver import LidarStream, LidarUDPReceiver
+from lidar_udp_receiver import LidarStream
 
 VIS_SIZE = 50
 
@@ -19,8 +19,7 @@ ctr.set_lookat([0, 0, 1.5])       # point the camera is aimed at
 ctr.set_front([0, -1, 0.3])     # direction the camera faces, pointing toward lookat
 ctr.set_up([0, 0, 1])           # which way is "up" on screen
 ctr.set_zoom(2)               # smaller = zoomed in closer
-
-time.sleep(0.1)
+lidar.wait_until_ready()
 
 try:
     while True:
