@@ -439,7 +439,7 @@ class LidarStream:
     """
 
     def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
-                 scan_maxlen: int = 50, imu_maxlen: int = 500,
+                 scan_maxlen: int = 180, imu_maxlen: int = 250,
                  timeout: float = 1.0, buffer_size: int = 65536):
         self._receiver = LidarUDPReceiver(port=port, ip=ip,
                                           timeout=timeout, buffer_size=buffer_size)
