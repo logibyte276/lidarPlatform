@@ -3,9 +3,9 @@ import numpy as np
 import open3d as o3d
 from lidar_udp_receiver import LidarStream, LidarUDPReceiver
 
-VIS_BLOCK = 50
+VIS_SIZE = 50
 
-lidar = LidarStream()
+lidar = LidarStream(scan_maxlen=VIS_SIZE+50)
 lidar.start()
 print("LiDAR started.")
 
@@ -24,7 +24,7 @@ time.sleep(0.1)
 
 try:
     while True:
-        scans = lidar.recent_scans(VIS_BLOCK)
+        scans = lidar.recent_scans(VIS_SIZE)
         xyz_list = [s.xyz_intensity()[0] for s in scans]
         points = np.concatenate(xyz_list, axis=0).astype(np.float64)
 
