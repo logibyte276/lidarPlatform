@@ -35,7 +35,7 @@ Example usage (buffered):
             # single newest reading
             scan = lidar.latest_scan
             if scan is not None:
-                xyz, intensity = scan.to_numpy()
+                xyz, intensity = scan.xyz_intensity()
                 # ... feed xyz into your obstacle-avoidance / SLAM code
 
             # or the N most recent, oldest-first
@@ -106,14 +106,16 @@ class LidarScan:
     valid_points_num: int
     points: np.ndarray  # structured array, dtype = _POINT_DTYPE, length == valid_points_num
 
-    def to_numpy(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (Nx3 xyz array, N-length intensity array) for this scan."""
+    def xyz_intensity(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Split this scan's structured points into (Nx3 xyz array, N-length
+        intensity array). Use this instead of indexing .points directly when
+        you want plain arrays for math / plotting / SLAM libraries."""
         xyz = np.stack([self.points['x'], self.points['y'], self.points['z']], axis=1)
         return xyz, self.points['intensity']
 
     def point(self, i: int) -> LidarPoint:
         """Convenience accessor for a single point as a LidarPoint object.
-        Fine for occasional single-point lookups; use to_numpy() instead if
+        Fine for occasional single-point lookups; use xyz_intensity() instead if
         you're processing the whole scan, since building a LidarPoint per
         point in a loop defeats the point of the vectorized parsing below."""
         p = self.points[i]
@@ -437,7 +439,7 @@ class LidarStream:
     """
 
     def __init__(self, port: int = 12345, ip: str = "0.0.0.0",
-                 scan_maxlen: int = 100, imu_maxlen: int = 250,
+                 scan_maxlen: int = 50, imu_maxlen: int = 500,
                  timeout: float = 1.0, buffer_size: int = 65536):
         self._receiver = LidarUDPReceiver(port=port, ip=ip,
                                           timeout=timeout, buffer_size=buffer_size)
