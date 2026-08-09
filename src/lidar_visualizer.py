@@ -3,14 +3,14 @@ import numpy as np
 import open3d as o3d
 from lidar_udp_receiver import LidarStream, LidarUDPReceiver
 
-VIS_BLOCK = 5
+VIS_BLOCK = 50
 
 lidar = LidarStream()
 lidar.start()
 print("LiDAR started.")
 
 vis = o3d.visualization.Visualizer()
-vis.create_window(window_name="Unitree LiDAR Point Cloud", width=1024, height=768)
+vis.create_window(window_name="Unitree LiDAR Point Cloud", width=2000, height=1400)
 pcd = o3d.geometry.PointCloud()
 vis.add_geometry(pcd)  
 vis.add_geometry(o3d.geometry.TriangleMesh.create_coordinate_frame(size=1.0, origin=[0, 0, 0]))
@@ -19,6 +19,8 @@ ctr.set_lookat([0, 0, 1.5])       # point the camera is aimed at
 ctr.set_front([0, -1, 0.3])     # direction the camera faces, pointing toward lookat
 ctr.set_up([0, 0, 1])           # which way is "up" on screen
 ctr.set_zoom(2)               # smaller = zoomed in closer
+
+time.sleep(0.1)
 
 try:
     while True:
@@ -32,7 +34,7 @@ try:
         if not vis.poll_events():   # False if the user closed the window
             break
         vis.update_renderer()
-        time.sleep(0.01)
+        time.sleep(0.001)
 
 except KeyboardInterrupt:
     print("\nStopped by Ctrl+C.")
