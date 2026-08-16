@@ -21,7 +21,6 @@ ctr.set_front([0, -1, 0.3])     # direction the camera faces, pointing toward lo
 ctr.set_up([0, 0, 1])           # which way is "up" on screen
 ctr.set_zoom(2)               # smaller = zoomed in closer
 lidar.wait_until_ready()
-vispoints = np.array([])
 
 
 
