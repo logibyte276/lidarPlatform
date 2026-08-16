@@ -82,7 +82,7 @@ try:
         if not vis.poll_events():
           break
         vis.update_renderer()
-        print(f"Valid points per second: {round(accumulator.total_points / (time.time() - start_time}")
+        print(f"Valid points per second: {round(accumulator.points_total / (time.time() - start_time))}")
         time.sleep(refresh_period)
 except KeyboardInterrupt:
     print("\nStopped by Ctrl+C.")
