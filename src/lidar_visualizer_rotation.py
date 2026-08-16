@@ -48,7 +48,7 @@ class RotatedScanAccumulator:
         return np.concatenate(self._rotated_scans, axis=0).astype(np.float64)
 
 
-lidar = LidarStream(scan_maxlen=VIS_SIZE + 100, imu_maxlen=round(VIS_SIZE * 2.25))
+lidar = LidarStream(scan_maxlen=round(180/REFRESH_HZ)+50, imu_maxlen=round(250/REFRESH_HZ)+100)
 lidar.start()
 print("LiDAR started.")
 
