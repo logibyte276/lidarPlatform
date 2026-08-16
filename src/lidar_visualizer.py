@@ -25,7 +25,7 @@ try:
     while True:
         scans = lidar.recent_scans(VIS_SIZE)
         xyz_list = [s.xyz_intensity()[0] for s in scans]
-        points = np.concatenate(xyz_list, axis=0).astype(np.float64)
+        points = np.concatenate(xyz_list, axis=0).astype(np.float64) # A list of arrays (a 3D array basically) gets turned into one big array
 
         pcd.points = o3d.utility.Vector3dVector(points)
         vis.update_geometry(pcd)
