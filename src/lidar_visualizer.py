@@ -33,7 +33,7 @@ try:
         if not vis.poll_events():   # False if the user closed the window
             break
         vis.update_renderer()
-        time.sleep(0.001)
+        time.sleep(0.01)
 
 except KeyboardInterrupt:
     print("\nStopped by Ctrl+C.")
