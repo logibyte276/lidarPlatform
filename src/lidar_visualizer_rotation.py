@@ -25,6 +25,7 @@ class RotatedScanAccumulator:
     def __init__(self, max_scans=VIS_SIZE, max_time_gap=MAX_TIME_GAP):
         self.max_time_gap = max_time_gap
         self._rotated_scans = deque(maxlen=max_scans)
+        self.points_total = 0
 
     def update(self, lidar_stream):
         new_scans = lidar_stream.scans.drain()
@@ -41,6 +42,7 @@ class RotatedScanAccumulator:
                 continue
             xyz, _intensity = scan.xyz_intensity()
             self._rotated_scans.append(rotate_points(xyz, closest.quaternion))
+            self.points_total += len(xyz)
 
     def get_points(self):
         if not self._rotated_scans:
@@ -51,6 +53,7 @@ class RotatedScanAccumulator:
 lidar = LidarStream(scan_maxlen=round(180/REFRESH_HZ)+50, imu_maxlen=round(250/REFRESH_HZ)+100)
 lidar.start()
 print("LiDAR started.")
+start_time = time.time()
 
 vis = o3d.visualization.Visualizer()
 vis.create_window(window_name="Unitree LiDAR Point Cloud", width=2000, height=1400)
@@ -79,6 +82,7 @@ try:
         if not vis.poll_events():
           break
         vis.update_renderer()
+        print(f"Valid points per second: {round(accumulator.total_points / (time.time() - start_time}")
         time.sleep(refresh_period)
 except KeyboardInterrupt:
     print("\nStopped by Ctrl+C.")
