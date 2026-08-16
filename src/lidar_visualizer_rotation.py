@@ -6,7 +6,7 @@ from lidar_udp_receiver import LidarStream
 VIS_SIZE = 100
 REFRESH_HZ = 120
 
-lidar = LidarStream()
+lidar = LidarStream(scan_maxlen=VIS_SIZE+100, imu_maxlen=round(VIS_SIZE*2.25))
 lidar.start()
 print("LiDAR started.")
 
