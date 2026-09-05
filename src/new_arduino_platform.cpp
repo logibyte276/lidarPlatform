@@ -78,8 +78,8 @@ void writeESC() {
     leftESC.writeMicroseconds(left);
     rightESC.writeMicroseconds(right);
   } else {
-      leftESC.writeMicroseconds(1500);
-      rightESC.writeMicroseconds(1500);
+    leftESC.writeMicroseconds(1500);
+    rightESC.writeMicroseconds(1500);
   }
 }
 
