@@ -50,33 +50,33 @@ void yawISR() {
 
 void writeESC() {
   if (armPin == LOW) {
-      // Read volatile variables safely by temporarily disabling interrupts
-      noInterrupts();
-      int throttle = throttleWidth;
-      int yaw = yawWidth;
-      interrupts();
-      // Deadband
-      if (abs(throttle - 1500) < 25) {
-        throttle = 1500;
-      }
-      if (abs(yaw - 1500) < 25) {
-        yaw = 1500;
-      }
-      // Convert to offsets from center
-      throttle -= 1500;
-      yaw -= 1500;
-      // Tank mix
-      int left = throttle + yaw;
-      int right = throttle - yaw;
-      // Back to servo pulse widths (1000us to 2000us)
-      left += 1500;
-      right += 1500;
-      // Clamp values between 1000 and 2000
-      left = constrain(left, 1000, 2000);
-      right = constrain(right, 1000, 2000);
-      // Write PWM width directly to the ESCs
-      leftESC.writeMicroseconds(left);
-      rightESC.writeMicroseconds(right);
+    // Read volatile variables safely by temporarily disabling interrupts
+    noInterrupts();
+    int throttle = throttleWidth;
+    int yaw = yawWidth;
+    interrupts();
+    // Deadband
+    if (abs(throttle - 1500) < 25) {
+      throttle = 1500;
+    }
+    if (abs(yaw - 1500) < 25) {
+      yaw = 1500;
+    }
+    // Convert to offsets from center
+    throttle -= 1500;
+    yaw -= 1500;
+    // Tank mix
+    int left = throttle + yaw;
+    int right = throttle - yaw;
+    // Back to servo pulse widths (1000us to 2000us)
+    left += 1500;
+    right += 1500;
+    // Clamp values between 1000 and 2000
+    left = constrain(left, 1000, 2000);
+    right = constrain(right, 1000, 2000);
+    // Write PWM width directly to the ESCs
+    leftESC.writeMicroseconds(left);
+    rightESC.writeMicroseconds(right);
   } else {
       leftESC.writeMicroseconds(1500);
       rightESC.writeMicroseconds(1500);
