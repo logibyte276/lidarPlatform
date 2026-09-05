@@ -8,7 +8,7 @@ const int throttlePin = 2; // Hardware Interrupt 0, Channel 3 on receiver
 const int yawPin      = 3; // Hardware Interrupt 1, Channel 1 on receiver
 const int escLeftPin  = 5; 
 const int escRightPin = 6; 
-const int armPin = 4;
+const int armPin = 4; // Channel 5 on receiver
 
 // Variables
 volatile unsigned long throttleStart = 0;
@@ -49,7 +49,7 @@ void yawISR() {
 }
 
 void writeESC() {
-  if (armPin == LOW) {
+  if (digitalRead(armPin) == LOW) {
     // Read volatile variables safely by temporarily disabling interrupts
     noInterrupts();
     int throttle = throttleWidth;
